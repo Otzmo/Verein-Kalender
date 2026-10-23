@@ -1,0 +1,121 @@
+rules_version = '2';
+
+// Sicherheitsregeln für den Kalender.
+// Besitzer melden sich mit E-Mail an. Besucher eines Zugriffslinks werden anonym angemeldet
+// und tragen sich unter calendars/{c}/members/{uid} mit der ID ihres Links ein.
+// Rechte-Stufen pro Unterkalender: 0 kein Zugriff, 1 ohne Details lesen, 2 lesen,
+// 3 hinzufügen (und eigene Termine bearbeiten), 4 bearbeiten.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isAccount() { return signedIn() && request.auth.token.firebase.sign_in_provider != 'anonymous'; }
+
+    function calPath(c) { return /databases/$(database)/documents/calendars/$(c); }
+    function memberPath(c) { return /databases/$(database)/documents/calendars/$(c)/members/$(request.auth.uid); }
+    function linkPath(id) { return /databases/$(database)/documents/links/$(id); }
+
+    function isOwner(c) { return signedIn() && exists(calPath(c)) && get(calPath(c)).data.ownerUid == request.auth.uid; }
+
+    // Der Link, über den der Besucher beigetreten ist. Gelöschte oder fremde Links geben keine Rechte.
+    function linkOf(c) {
+      let id = get(memberPath(c)).data.accessId;
+      let l = exists(linkPath(id)) ? get(linkPath(id)).data : null;
+      return l != null && l.calendarId == c ? l : { 'calendarId': '', 'perms': {}, 'defaultLevel': 0, 'admin': false, 'bookTarget': '' };
+    }
+    function hasLink(c) { return signedIn() && exists(memberPath(c)) && linkOf(c).get('calendarId', '') == c; }
+    function isAdmin(c) { return isOwner(c) || (hasLink(c) && linkOf(c).get('admin', false) == true); }
+    function level(c, s) {
+      return isOwner(c) ? 4
+        : !hasLink(c) ? 0
+        : linkOf(c).get('admin', false) == true ? 4
+        : linkOf(c).get('perms', {}).get(s, linkOf(c).get('defaultLevel', 0));
+    }
+    function isBooker(c, s) { return hasLink(c) && linkOf(c).get('bookTarget', '') == s; }
+
+    // Ein Link taugt zum Beitreten, wenn er zum Kalender gehört und kein Passwort-Platzhalter ist.
+    function validAccess(c, id) {
+      return id is string && exists(linkPath(id))
+        && get(linkPath(id)).data.calendarId == c
+        && get(linkPath(id)).data.get('passwordRequired', false) == false;
+    }
+
+    function validTimes(d) {
+      return d.start is string && d.end is string && d.queryEnd is string && d.createdBy is string
+        && d.start.size() <= 16 && d.end.size() <= 16;
+    }
+    function validEvent(d) { return validTimes(d) && d.title is string && d.title.size() <= 300 && d.notes is string && d.notes.size() <= 10000; }
+    function canCreate(c, s) {
+      return level(c, s) >= 4 || ((level(c, s) >= 3 || isBooker(c, s)) && request.resource.data.createdBy == request.auth.uid);
+    }
+    function canChange(c, s) {
+      return level(c, s) >= 4 || (level(c, s) >= 3 && resource.data.createdBy == request.auth.uid);
+    }
+
+    match /calendars/{c} {
+      allow get: if signedIn() && (resource.data.ownerUid == request.auth.uid || hasLink(c));
+      allow list: if signedIn() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isAccount() && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.name is string && request.resource.data.name.size() <= 100;
+      allow update: if isAdmin(c) && request.resource.data.ownerUid == resource.data.ownerUid
+        && request.resource.data.name is string && request.resource.data.name.size() <= 100;
+      allow delete: if isOwner(c);
+
+      match /members/{uid} {
+        allow get: if signedIn() && (request.auth.uid == uid || isAdmin(c));
+        allow list: if isAdmin(c);
+        allow create, update: if signedIn() && request.auth.uid == uid && validAccess(c, request.resource.data.accessId);
+        allow delete: if signedIn() && (request.auth.uid == uid || isAdmin(c));
+      }
+
+      match /subcalendars/{s} {
+        allow read: if isOwner(c) || hasLink(c);
+        allow create, update, delete: if isAdmin(c);
+
+        match /events/{e} {
+          allow read: if level(c, s) >= 2;
+          allow create: if validEvent(request.resource.data) && canCreate(c, s);
+          allow update: if validEvent(request.resource.data) && canChange(c, s)
+            && request.resource.data.createdBy == resource.data.createdBy;
+          allow delete: if canChange(c, s);
+
+          match /signups/{u} {
+            allow read: if level(c, s) >= 2;
+            allow create, update: if level(c, s) >= 2 && request.auth.uid == u
+              && request.resource.data.name is string && request.resource.data.name.size() <= 100;
+            allow delete: if signedIn() && (request.auth.uid == u || level(c, s) >= 4);
+          }
+
+          match /comments/{m} {
+            allow read: if level(c, s) >= 2;
+            allow create: if level(c, s) >= 2 && request.resource.data.uid == request.auth.uid
+              && request.resource.data.text is string && request.resource.data.text.size() <= 2000
+              && request.resource.data.name is string && request.resource.data.name.size() <= 100;
+            allow delete: if signedIn() && (resource.data.uid == request.auth.uid || level(c, s) >= 4);
+          }
+        }
+
+        // Kopie ohne Details für die Stufe "ohne Details lesen" und für Buchungslinks.
+        match /busy/{e} {
+          allow read: if level(c, s) >= 1;
+          allow create: if validTimes(request.resource.data) && canCreate(c, s);
+          allow update: if validTimes(request.resource.data) && canChange(c, s)
+            && request.resource.data.createdBy == resource.data.createdBy;
+          allow delete: if canChange(c, s);
+        }
+      }
+    }
+
+    // Zugriffslinks. Wer den Schlüssel kennt, darf den Link lesen; auflisten dürfen nur Verwalter.
+    match /links/{id} {
+      allow get: if signedIn();
+      allow list: if signedIn() && (resource.data.ownerUid == request.auth.uid || isAdmin(resource.data.calendarId));
+      allow create: if signedIn() && isAdmin(request.resource.data.calendarId)
+        && request.resource.data.ownerUid == get(calPath(request.resource.data.calendarId)).data.ownerUid;
+      allow update: if signedIn() && isAdmin(resource.data.calendarId)
+        && request.resource.data.calendarId == resource.data.calendarId
+        && request.resource.data.ownerUid == resource.data.ownerUid;
+      allow delete: if signedIn() && isAdmin(resource.data.calendarId);
+    }
+  }
+}
